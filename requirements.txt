@@ -1,0 +1,9 @@
+# torch is intentionally not pinned here - install it separately first,
+# see README (CPU-only wheel vs. the default CUDA one differ a lot in size).
+transformers>=5.0,<6.0
+accelerate>=0.34
+pandas>=2.2
+numpy>=1.26
+scikit-learn>=1.4
+matplotlib>=3.8
+seaborn>=0.13
