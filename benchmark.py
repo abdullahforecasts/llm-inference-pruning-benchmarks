@@ -124,7 +124,24 @@ def run_once(model, prompt_ids, max_new_tokens, device, prune_cfg=None, prefill_
     return metrics
 
 
+METRIC_KEYS = ["ttft_s", "decode_time_s", "throughput_tok_s", "peak_mem_mb", "kv_cache_mb", "evictions"]
+
+
 def run_repeated(model, prompt_ids, args, prune_cfg, prefill_chunk):
+    """Warm-up + timed repeats. A CUDA OOM is recorded as status="oom" with empty metrics."""
+    try:
+        agg = _run_repeated(model, prompt_ids, args, prune_cfg, prefill_chunk)
+        agg["status"] = "ok"
+    except torch.OutOfMemoryError:
+        agg = {k: float("nan") for key in METRIC_KEYS for k in (key, key + "_std")}
+        agg["status"] = "oom"
+    gc.collect()
+    if args.device == "cuda":
+        torch.cuda.empty_cache()
+    return agg
+
+
+def _run_repeated(model, prompt_ids, args, prune_cfg, prefill_chunk):
     for _ in range(args.warmup):
         run_once(model, prompt_ids, args.max_new_tokens, args.device, prune_cfg, prefill_chunk)
     runs = [run_once(model, prompt_ids, args.max_new_tokens, args.device, prune_cfg, prefill_chunk)
@@ -182,7 +199,6 @@ def main():
     prune_cfg = PruneConfig(window_size=args.window_size, sink_tokens=args.sink_tokens, mode=args.mode,
                             obs_window=args.obs_window, evict_slack=args.evict_slack)
 
-    rows = []
     for seq_len in args.seq_lens:
         prompt_ids = build_prompt(tokenizer, seq_len, args.batch_size, args.device, vocab_size)
         actual_len = prompt_ids.shape[1]
@@ -191,6 +207,7 @@ def main():
         pruned = run_repeated(model, prompt_ids, args, prune_cfg, args.prefill_chunk)
 
         pruning_active = actual_len + args.max_new_tokens > args.window_size
+        rows = []
         for label, metrics in [("baseline", baseline), ("pruned", pruned)]:
             rows.append({
                 "model": args.model, "batch_size": args.batch_size, "seq_len": actual_len,
@@ -203,20 +220,21 @@ def main():
                 "evict_slack": args.evict_slack if label == "pruned" else "",
                 "repeats": args.repeats, **metrics,
             })
-        print(f"seq_len={actual_len} bs={args.batch_size} evictions={pruned['evictions']:.0f} | "
-              f"baseline tok/s={baseline['throughput_tok_s']:.1f} peak={baseline['peak_mem_mb']:.0f}MB "
-              f"kv={baseline['kv_cache_mb']:.1f}MB | "
-              f"pruned tok/s={pruned['throughput_tok_s']:.1f} peak={pruned['peak_mem_mb']:.0f}MB "
-              f"kv={pruned['kv_cache_mb']:.1f}MB")
+        # write after every setting so a crash later on keeps what already finished
+        write_header = not os.path.exists(args.out)
+        with open(args.out, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            if write_header:
+                writer.writeheader()
+            writer.writerows(rows)
 
-    write_header = not os.path.exists(args.out)
-    with open(args.out, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        if write_header:
-            writer.writeheader()
-        writer.writerows(rows)
-    print(f"wrote {len(rows)} rows to {args.out}")
-
+        def fmt(m):
+            if m["status"] != "ok":
+                return "OOM"
+            return f"tok/s={m['throughput_tok_s']:.1f} peak={m['peak_mem_mb']:.0f}MB kv={m['kv_cache_mb']:.1f}MB"
+        print(f"seq_len={actual_len} bs={args.batch_size} | baseline {fmt(baseline)} | "
+              f"pruned {fmt(pruned)} evictions={pruned['evictions']:.0f}", flush=True)
+    print(f"results appended to {args.out}")
 
 if __name__ == "__main__":
     main()

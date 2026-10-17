@@ -95,25 +95,34 @@ def plot_throughput(df, out_path):
 
 
 def summarize(df):
+    if "status" not in df:
+        df = df.assign(status="ok")
     rows = []
     for model, bs, g in groups(df):
         g = g[g["pruning_active"]]
         if g.empty:
             continue
-        piv = g.pivot_table(index="seq_len", columns="run",
-                            values=["peak_mem_mb", "throughput_tok_s"])
-        mem_red = 1 - piv["peak_mem_mb"]["pruned"] / piv["peak_mem_mb"]["baseline"]
-        speedup = piv["throughput_tok_s"]["pruned"] / piv["throughput_tok_s"]["baseline"]
-        rows.append({
-            "model": model, "batch_size": bs,
-            "seq_lens": " ".join(str(s) for s in piv.index),
-            "mean_peak_mem_reduction_pct": round(100 * mem_red.mean(), 2),
-            "max_peak_mem_reduction_pct": round(100 * mem_red.max(), 2),
-            "mean_throughput_speedup_x": round(speedup.mean(), 3),
-            "max_throughput_speedup_x": round(speedup.max(), 3),
-        })
+        status = g.pivot_table(index="seq_len", columns="run", values="status", aggfunc="first")
+        oom = [str(s) for s in status.index if status.loc[s].get("baseline") == "oom"
+               and status.loc[s].get("pruned") == "ok"]
+        ok = g[g["status"] == "ok"]
+        piv = ok.pivot_table(index="seq_len", columns="run",
+                             values=["peak_mem_mb", "throughput_tok_s"]).dropna()
+        row = {"model": model, "batch_size": bs,
+               "seq_lens": " ".join(str(s) for s in piv.index),
+               "baseline_oom_at": " ".join(oom)}
+        if not piv.empty and "baseline" in piv["peak_mem_mb"]:
+            mem_red = 1 - piv["peak_mem_mb"]["pruned"] / piv["peak_mem_mb"]["baseline"]
+            speedup = piv["throughput_tok_s"]["pruned"] / piv["throughput_tok_s"]["baseline"]
+            row.update({
+                "mean_peak_mem_reduction_pct": round(100 * mem_red.mean(), 2),
+                "max_peak_mem_reduction_pct": round(100 * mem_red.max(), 2),
+                "mean_throughput_speedup_x": round(speedup.mean(), 3),
+                "max_throughput_speedup_x": round(speedup.max(), 3),
+            })
+        rows.append(row)
     summary = pd.DataFrame(rows)
-    print("summary (settings where pruning evicted tokens):")
+    print("summary (settings where pruning evicted tokens; baseline OOMs listed separately):")
     print(summary.to_string(index=False) if not summary.empty else "  none")
     return summary
 

@@ -44,7 +44,17 @@ repeats (mean and std go into the CSV). The pruned run prefills in 512-token
 chunks and evicts after every chunk; the baseline prefills the whole prompt at
 once and keeps the full cache.
 
-Main sweep: importance-based eviction, window 512, at batch 1 and batch 8.
+Main sweep: importance-based eviction, window 512.
+
+- batch 1: the baseline prefills the whole prompt in one pass. On a T4 that
+  runs out of memory for long prompts; the run is recorded as `oom` in the CSV
+  and the sweep continues.
+- batch 8: the baseline also prefills in 512-token chunks
+  (`--baseline-prefill-chunk 512`) but keeps the full cache, so both runs fit
+  and the comparison isolates the effect of the bounded cache.
+
+Results are appended to the CSV after every prompt length, so a crash keeps
+what already finished.
 """),
     ("code", """\
 RUN = "v2_t4"
@@ -58,21 +68,21 @@ COMMON = "--max-new-tokens 128 --window-size 512 --sink-tokens 4 --prefill-chunk
 !python benchmark.py --model llama3.2-1b --batch-size 1 --seq-lens 1024 2048 4096 8192 --mode importance {COMMON} --out {OUT}
 """),
     ("code", """\
-!python benchmark.py --model qwen2.5-0.5b --batch-size 8 --seq-lens 2048 4096 8192 --mode importance {COMMON} --out {OUT}
+!python benchmark.py --model qwen2.5-0.5b --batch-size 8 --seq-lens 2048 4096 8192 --mode importance --baseline-prefill-chunk 512 {COMMON} --out {OUT}
 """),
     ("code", """\
-!python benchmark.py --model llama3.2-1b --batch-size 8 --seq-lens 2048 4096 8192 --mode importance {COMMON} --out {OUT}
+!python benchmark.py --model llama3.2-1b --batch-size 8 --seq-lens 2048 4096 8192 --mode importance --baseline-prefill-chunk 512 {COMMON} --out {OUT}
 """),
     ("markdown", """\
-### Ablations (llama3.2-1b, batch 8)
+### Ablations (llama3.2-1b)
 
-- recency-only eviction (`--mode sliding_window`)
-- baseline that also prefills in 512-token chunks (`--baseline-prefill-chunk 512`),
-  to separate what chunking alone buys from what the bounded cache buys
+- batch 8, recency-only eviction (`--mode sliding_window`) vs. importance
+- batch 1, baseline that also prefills in 512-token chunks, to separate what
+  chunked prefill alone saves from what the bounded cache saves
 """),
     ("code", """\
-!python benchmark.py --model llama3.2-1b --batch-size 8 --seq-lens 2048 4096 8192 --mode sliding_window {COMMON} --out results/{RUN}/ablation_sliding_window.csv
-!python benchmark.py --model llama3.2-1b --batch-size 8 --seq-lens 2048 4096 8192 --mode importance --baseline-prefill-chunk 512 {COMMON} --out results/{RUN}/ablation_chunked_baseline.csv
+!python benchmark.py --model llama3.2-1b --batch-size 8 --seq-lens 2048 4096 8192 --mode sliding_window --baseline-prefill-chunk 512 {COMMON} --out results/{RUN}/ablation_sliding_window.csv
+!python benchmark.py --model llama3.2-1b --batch-size 1 --seq-lens 1024 2048 4096 8192 --mode importance --baseline-prefill-chunk 512 {COMMON} --out results/{RUN}/ablation_chunked_baseline.csv
 """),
     ("markdown", """\
 ### Quality: WikiText-2 perplexity, full cache vs. pruned cache
