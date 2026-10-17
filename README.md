@@ -32,12 +32,10 @@ module exposes `layer_idx` and follows the same `[batch, heads, seq, head_dim]`
 layout, which is Qwen2/2.5 and Llama-3.x as-is, and most other decoder-only
 models with minimal changes.
 
-One simplification worth calling out: because the cache is compacted, future
-position ids are computed against the *compacted* cache length rather than
-the true token count. This is the same trick sliding-window attention
-implementations use: it keeps generation stable, but it means retained
-tokens are attended to at a shifted relative position, which is part of the
-quality/memory trade-off being measured here, not a bug to route around.
+Positions: once the cache is compacted its length no longer equals the
+number of tokens seen, so `benchmark.py` passes the true absolute position of
+every new token (`position_ids`) during decode. Retained tokens keep the
+rotary positions they were cached with, so relative distances stay correct.
 
 ## Files
 
@@ -93,13 +91,21 @@ a tiny random-weight model, and peak memory on CPU falls back to process RSS
 high-water mark, not an isolated per-run measurement. It's there to catch
 crashes and shape bugs before spending GPU time, not to show a trend.
 
-Real sweep, on a GPU:
+Real sweep, on a GPU (Colab T4, see `notebooks/colab_sweep.ipynb`):
 
 ```bash
 python benchmark.py --model qwen2.5-0.5b --seq-lens 256 512 1024 2048 \
-    --max-new-tokens 128 --window-size 512 --mode importance --device cuda
-python visualize.py
+    --batch-size 1 --max-new-tokens 128 --window-size 512 --mode importance \
+    --warmup 1 --repeats 3 --device cuda --out results/v1_t4/benchmark.csv
+python visualize.py --csv results/v1_t4/benchmark.csv --out-dir results/v1_t4/figures
 ```
+
+Each setting gets `--warmup` untimed runs and `--repeats` timed runs; the CSV
+stores mean and std for TTFT, decode time, throughput, peak memory and final
+KV-cache size. The baseline runs on SDPA attention; importance-mode pruning
+switches to eager attention because it needs the attention weights.
+`visualize.py` writes per-model figures and a `summary.csv` that only counts
+settings where pruning actually evicted tokens.
 
 `--model` accepts any key from `config.MODELS` (Qwen2.5 and Llama-3.2
 variants); add more there as needed. `--mode sliding_window` runs the

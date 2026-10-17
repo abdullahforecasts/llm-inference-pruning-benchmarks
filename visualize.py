@@ -1,7 +1,16 @@
 """
-Turns results/benchmark.csv into the figures used to back the memory/throughput
-claims: peak VRAM vs. sequence length (baseline vs. pruned, with a linear fit on
-each to show the scaling trend), and a throughput/TTFT comparison bar chart.
+Turns a benchmark CSV into the figures and summary behind the memory/throughput
+numbers:
+
+  - memory_scaling.png: peak VRAM vs. sequence length per model (baseline vs.
+    pruned), with a scikit-learn linear fit on each to show the scaling trend.
+  - throughput_comparison.png: decode throughput and time-to-first-token per
+    model and sequence length, with std error bars when repeats were recorded.
+  - summary.csv: per model / batch size, mean peak-memory reduction and
+    throughput speedup, computed only over settings where pruning actually
+    evicted tokens (prompt + generated tokens > window).
+
+Also reads the older v0 CSV format (no batch_size / std / pruning_active columns).
 """
 
 import argparse
@@ -14,64 +23,99 @@ import seaborn as sns
 from sklearn.linear_model import LinearRegression
 
 sns.set_theme(style="whitegrid")
+COLORS = {"baseline": "#d95f02", "pruned": "#1b9e77"}
+KEYS = ["model", "batch_size", "seq_len"]
 
 
 def load(csv_path):
     df = pd.read_csv(csv_path)
-    return df
+    if "batch_size" not in df:
+        df["batch_size"] = 1
+    if "max_new_tokens" not in df:
+        df["max_new_tokens"] = 128
+    pruned = df[df["run"] == "pruned"].copy()
+    if "pruning_active" not in df or pruned["pruning_active"].isna().all():
+        pruned["pruning_active"] = (pruned["seq_len"] + pruned["max_new_tokens"]
+                                    > pd.to_numeric(pruned["window_size"]))
+    active = pruned.set_index(KEYS)["pruning_active"].astype(str).str.lower() == "true"
+    df = df.drop(columns=["pruning_active"], errors="ignore")
+    df = df.join(active.rename("pruning_active"), on=KEYS)
+    df["pruning_active"] = df["pruning_active"].fillna(False).astype(bool)
+    # if a setting was run more than once (appended CSV), keep the latest
+    return df.drop_duplicates(subset=KEYS + ["run"], keep="last")
 
 
-def fit_scaling(df, run_label, y_col="peak_mem_mb"):
-    sub = df[df["run"] == run_label].sort_values("seq_len")
-    X = sub[["seq_len"]].values
-    y = sub[y_col].values
-    reg = LinearRegression().fit(X, y)
-    return sub["seq_len"].values, y, reg
+def groups(df):
+    return [(m, b, g) for (m, b), g in df.groupby(["model", "batch_size"], sort=False)]
 
 
 def plot_memory_scaling(df, out_path):
-    fig, ax = plt.subplots(figsize=(7, 5))
-    for run_label, color in [("baseline", "#d95f02"), ("pruned", "#1b9e77")]:
-        x, y, reg = fit_scaling(df, run_label, "peak_mem_mb")
-        ax.scatter(x, y, color=color, label=f"{run_label} (measured)")
-        x_line = np.linspace(x.min(), x.max(), 50).reshape(-1, 1)
-        ax.plot(x_line, reg.predict(x_line), color=color, linestyle="--",
-                 label=f"{run_label} fit (slope={reg.coef_[0]:.3f} MB/tok)")
-    ax.set_xlabel("sequence length (tokens)")
-    ax.set_ylabel("peak GPU memory (MB)")
-    ax.set_title("Peak memory vs. sequence length")
-    ax.legend()
+    gs = groups(df)
+    fig, axes = plt.subplots(1, len(gs), figsize=(6.5 * len(gs), 5), squeeze=False)
+    for ax, (model, bs, g) in zip(axes[0], gs):
+        for run in ["baseline", "pruned"]:
+            sub = g[g["run"] == run].sort_values("seq_len")
+            x, y = sub[["seq_len"]].values, sub["peak_mem_mb"].values
+            ax.scatter(x, y, color=COLORS[run], label=f"{run} (measured)")
+            if len(sub) >= 2:
+                reg = LinearRegression().fit(x, y)
+                xl = np.linspace(x.min(), x.max(), 50).reshape(-1, 1)
+                ax.plot(xl, reg.predict(xl), color=COLORS[run], linestyle="--",
+                        label=f"{run} fit ({reg.coef_[0]:.3f} MB/tok)")
+        ax.set_title(f"{model}, batch {bs}")
+        ax.set_xlabel("prompt length (tokens)")
+        ax.set_ylabel("peak GPU memory (MB)")
+        ax.legend(fontsize=8)
+    fig.suptitle("Peak memory vs. sequence length")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
 
+def _bars(ax, g, value, title, ylabel):
+    piv = g.pivot_table(index="seq_len", columns="run", values=value)
+    std_col = value + "_std"
+    err = g.pivot_table(index="seq_len", columns="run", values=std_col) if std_col in g else None
+    piv.plot(kind="bar", ax=ax, color=[COLORS[c] for c in piv.columns],
+             yerr=err, capsize=3, rot=0)
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
+    ax.set_xlabel("prompt length (tokens)")
+
+
 def plot_throughput(df, out_path):
-    fig, axes = plt.subplots(1, 2, figsize=(11, 5))
-
-    pivot_tp = df.pivot_table(index="seq_len", columns="run", values="throughput_tok_s")
-    pivot_tp.plot(kind="bar", ax=axes[0], color=["#d95f02", "#1b9e77"])
-    axes[0].set_ylabel("tokens/sec")
-    axes[0].set_title("Decode throughput")
-
-    pivot_ttft = df.pivot_table(index="seq_len", columns="run", values="ttft_s")
-    pivot_ttft.plot(kind="bar", ax=axes[1], color=["#d95f02", "#1b9e77"])
-    axes[1].set_ylabel("seconds")
-    axes[1].set_title("Time to first token")
-
+    gs = groups(df)
+    fig, axes = plt.subplots(len(gs), 2, figsize=(12, 4.5 * len(gs)), squeeze=False)
+    for row, (model, bs, g) in zip(axes, gs):
+        _bars(row[0], g, "throughput_tok_s", f"{model}, batch {bs}: decode throughput", "tokens/sec")
+        _bars(row[1], g, "ttft_s", f"{model}, batch {bs}: time to first token", "seconds")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
 
 def summarize(df):
-    agg = df.groupby("run")[["peak_mem_mb", "throughput_tok_s"]].mean()
-    mem_reduction = 1 - agg.loc["pruned", "peak_mem_mb"] / agg.loc["baseline", "peak_mem_mb"]
-    speedup = agg.loc["pruned", "throughput_tok_s"] / agg.loc["baseline", "throughput_tok_s"]
-    print(agg)
-    print(f"mean peak memory reduction: {mem_reduction * 100:.1f}%")
-    print(f"mean throughput speedup: {speedup:.2f}x")
-    return {"mem_reduction": mem_reduction, "speedup": speedup}
+    rows = []
+    for model, bs, g in groups(df):
+        g = g[g["pruning_active"]]
+        if g.empty:
+            continue
+        piv = g.pivot_table(index="seq_len", columns="run",
+                            values=["peak_mem_mb", "throughput_tok_s"])
+        mem_red = 1 - piv["peak_mem_mb"]["pruned"] / piv["peak_mem_mb"]["baseline"]
+        speedup = piv["throughput_tok_s"]["pruned"] / piv["throughput_tok_s"]["baseline"]
+        rows.append({
+            "model": model, "batch_size": bs,
+            "seq_lens": " ".join(str(s) for s in piv.index),
+            "mean_peak_mem_reduction_pct": round(100 * mem_red.mean(), 2),
+            "max_peak_mem_reduction_pct": round(100 * mem_red.max(), 2),
+            "mean_throughput_speedup_x": round(speedup.mean(), 3),
+            "max_throughput_speedup_x": round(speedup.max(), 3),
+        })
+    summary = pd.DataFrame(rows)
+    print("summary (settings where pruning evicted tokens):")
+    print(summary.to_string(index=False) if not summary.empty else "  none")
+    return summary
 
 
 def main():
@@ -82,10 +126,9 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
     df = load(args.csv)
-
     plot_memory_scaling(df, os.path.join(args.out_dir, "memory_scaling.png"))
     plot_throughput(df, os.path.join(args.out_dir, "throughput_comparison.png"))
-    summarize(df)
+    summarize(df).to_csv(os.path.join(args.out_dir, "summary.csv"), index=False)
 
 
 if __name__ == "__main__":
