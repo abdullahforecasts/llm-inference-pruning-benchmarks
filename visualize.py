@@ -27,8 +27,30 @@ COLORS = {"baseline": "#d95f02", "pruned": "#1b9e77"}
 KEYS = ["model", "batch_size", "seq_len"]
 
 
+def read_mixed_csv(csv_path):
+    """Read a CSV whose later rows may carry one extra trailing column (`status`)
+    that the header, written by an earlier run, does not have."""
+    import csv
+    with open(csv_path, newline="") as f:
+        rows = list(csv.reader(f))
+    header, body = rows[0], [r for r in rows[1:] if r]
+    width = max(len(r) for r in body) if body else len(header)
+    if width == len(header) + 1 and "status" not in header:
+        header = header + ["status"]
+    body = [r + [""] * (len(header) - len(r)) for r in body]
+    df = pd.DataFrame(body, columns=header).replace(["", "nan", "NaN"], np.nan)
+    for col in df.columns:
+        if col != "status":
+            conv = pd.to_numeric(df[col], errors="coerce")
+            if conv.notna().sum() == df[col].notna().sum():
+                df[col] = conv
+    if "status" in df:
+        df["status"] = df["status"].fillna("ok")
+    return df
+
+
 def load(csv_path):
-    df = pd.read_csv(csv_path)
+    df = read_mixed_csv(csv_path)
     if "batch_size" not in df:
         df["batch_size"] = 1
     if "max_new_tokens" not in df:
@@ -54,7 +76,7 @@ def plot_memory_scaling(df, out_path):
     fig, axes = plt.subplots(1, len(gs), figsize=(6.5 * len(gs), 5), squeeze=False)
     for ax, (model, bs, g) in zip(axes[0], gs):
         for run in ["baseline", "pruned"]:
-            sub = g[g["run"] == run].sort_values("seq_len")
+            sub = g[g["run"] == run].dropna(subset=["peak_mem_mb"]).sort_values("seq_len")
             x, y = sub[["seq_len"]].values, sub["peak_mem_mb"].values
             ax.scatter(x, y, color=COLORS[run], label=f"{run} (measured)")
             if len(sub) >= 2:
