@@ -30,7 +30,7 @@ def load_tokens(tokenizer, n_tokens, vocab_size, seed=0):
         g = torch.Generator().manual_seed(seed)
         return torch.randint(0, vocab_size, (1, n_tokens), generator=g)
     from datasets import load_dataset
-    text = "\n\n".join(load_dataset("wikitext", "wikitext-2-raw-v1", split="test")["text"])
+    text = "\n\n".join(load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")["text"])
     ids = tokenizer(text, return_tensors="pt").input_ids
     if ids.shape[1] < n_tokens:
         raise ValueError(f"need {n_tokens} tokens, dataset has {ids.shape[1]}")
