@@ -12,9 +12,12 @@ of tokens seen, so the decode loop passes the true absolute position of every
 new token via `position_ids` instead of letting the model infer it from the
 cache length.
 
-Attention backend: the baseline uses SDPA. Importance-mode pruning needs the
-attention weights, so the pruned run switches the model to eager attention;
-sliding-window pruning stays on SDPA.
+Prefill: the pruned run feeds the prompt in chunks of --prefill-chunk tokens
+and the hooks evict after every chunk, so its KV cache never holds more than
+window + chunk tokens. The baseline prefills the whole prompt in one pass
+(--baseline-prefill-chunk 0); set it to the same chunk size to measure the
+effect of chunking alone. Both runs use SDPA attention and compute logits only
+for the last prompt token.
 
 On CUDA, peak memory is torch.cuda.max_memory_allocated(). On CPU (laptop smoke
 test) it falls back to process RSS, which is only good for catching crashes and
@@ -63,12 +66,20 @@ def kv_cache_mb(cache):
     return total / 1e6
 
 
-def set_attention(model, impl):
-    if model.config._attn_implementation != impl:
-        model.set_attn_implementation(impl)
+def prefill(model, prompt_ids, cache, chunk, device):
+    batch, prompt_len = prompt_ids.shape
+    step = chunk if chunk and chunk > 0 else prompt_len
+    out = None
+    for start in range(0, prompt_len, step):
+        end = min(start + step, prompt_len)
+        positions = torch.arange(start, end, device=device).unsqueeze(0).expand(batch, -1)
+        out = model(input_ids=prompt_ids[:, start:end], position_ids=positions,
+                    past_key_values=cache, use_cache=True, logits_to_keep=1)
+        cache = out.past_key_values
+    return out
 
 
-def run_once(model, prompt_ids, max_new_tokens, device, prune_cfg=None):
+def run_once(model, prompt_ids, max_new_tokens, device, prune_cfg=None, prefill_chunk=0):
     pruner = KVCachePruner(prune_cfg).attach(model) if prune_cfg is not None else None
     batch, prompt_len = prompt_ids.shape
 
@@ -81,8 +92,7 @@ def run_once(model, prompt_ids, max_new_tokens, device, prune_cfg=None):
     cache = DynamicCache(config=model.config)
     with torch.no_grad():
         t0 = time.perf_counter()
-        positions = torch.arange(prompt_len, device=device).unsqueeze(0).expand(batch, -1)
-        out = model(input_ids=prompt_ids, position_ids=positions, past_key_values=cache, use_cache=True)
+        out = prefill(model, prompt_ids, cache, prefill_chunk, device)
         next_id = out.logits[:, -1:].argmax(-1)
         _sync(device)
         ttft = time.perf_counter() - t0
@@ -106,6 +116,7 @@ def run_once(model, prompt_ids, max_new_tokens, device, prune_cfg=None):
         "throughput_tok_s": generated / decode_time if decode_time > 0 else float("nan"),
         "peak_mem_mb": torch.cuda.max_memory_allocated() / 1e6 if device == "cuda" else _peak_rss_mb(),
         "kv_cache_mb": kv_cache_mb(cache),
+        "evictions": pruner.evictions if pruner is not None else 0,
     }
     if pruner is not None:
         pruner.detach()
@@ -113,10 +124,10 @@ def run_once(model, prompt_ids, max_new_tokens, device, prune_cfg=None):
     return metrics
 
 
-def run_repeated(model, prompt_ids, args, prune_cfg):
+def run_repeated(model, prompt_ids, args, prune_cfg, prefill_chunk):
     for _ in range(args.warmup):
-        run_once(model, prompt_ids, args.max_new_tokens, args.device, prune_cfg)
-    runs = [run_once(model, prompt_ids, args.max_new_tokens, args.device, prune_cfg)
+        run_once(model, prompt_ids, args.max_new_tokens, args.device, prune_cfg, prefill_chunk)
+    runs = [run_once(model, prompt_ids, args.max_new_tokens, args.device, prune_cfg, prefill_chunk)
             for _ in range(args.repeats)]
     agg = {}
     for key in runs[0]:
@@ -150,6 +161,12 @@ def main():
     parser.add_argument("--window-size", type=int, default=512)
     parser.add_argument("--sink-tokens", type=int, default=4)
     parser.add_argument("--mode", default="importance", choices=["sliding_window", "importance"])
+    parser.add_argument("--prefill-chunk", type=int, default=512,
+                        help="prompt chunk size for the pruned run (0 = whole prompt at once)")
+    parser.add_argument("--baseline-prefill-chunk", type=int, default=0,
+                        help="prompt chunk size for the baseline run (0 = whole prompt at once)")
+    parser.add_argument("--obs-window", type=int, default=32)
+    parser.add_argument("--evict-slack", type=int, default=32)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -162,19 +179,16 @@ def main():
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     model, tokenizer, vocab_size = load_model(args)
-    prune_cfg = PruneConfig(window_size=args.window_size, sink_tokens=args.sink_tokens, mode=args.mode)
-    pruned_attn = "eager" if args.mode == "importance" else "sdpa"
+    prune_cfg = PruneConfig(window_size=args.window_size, sink_tokens=args.sink_tokens, mode=args.mode,
+                            obs_window=args.obs_window, evict_slack=args.evict_slack)
 
     rows = []
     for seq_len in args.seq_lens:
         prompt_ids = build_prompt(tokenizer, seq_len, args.batch_size, args.device, vocab_size)
         actual_len = prompt_ids.shape[1]
 
-        set_attention(model, "sdpa")
-        baseline = run_repeated(model, prompt_ids, args, prune_cfg=None)
-        set_attention(model, pruned_attn)
-        pruned = run_repeated(model, prompt_ids, args, prune_cfg=prune_cfg)
-        set_attention(model, "sdpa")
+        baseline = run_repeated(model, prompt_ids, args, None, args.baseline_prefill_chunk)
+        pruned = run_repeated(model, prompt_ids, args, prune_cfg, args.prefill_chunk)
 
         pruning_active = actual_len + args.max_new_tokens > args.window_size
         for label, metrics in [("baseline", baseline), ("pruned", pruned)]:
@@ -182,12 +196,14 @@ def main():
                 "model": args.model, "batch_size": args.batch_size, "seq_len": actual_len,
                 "max_new_tokens": args.max_new_tokens, "run": label,
                 "mode": args.mode if label == "pruned" else "none",
-                "attn_impl": pruned_attn if label == "pruned" else "sdpa",
+                "prefill_chunk": args.prefill_chunk if label == "pruned" else args.baseline_prefill_chunk,
                 "window_size": args.window_size if label == "pruned" else "",
                 "pruning_active": pruning_active if label == "pruned" else "",
+                "obs_window": args.obs_window if label == "pruned" else "",
+                "evict_slack": args.evict_slack if label == "pruned" else "",
                 "repeats": args.repeats, **metrics,
             })
-        print(f"seq_len={actual_len} bs={args.batch_size} | "
+        print(f"seq_len={actual_len} bs={args.batch_size} evictions={pruned['evictions']:.0f} | "
               f"baseline tok/s={baseline['throughput_tok_s']:.1f} peak={baseline['peak_mem_mb']:.0f}MB "
               f"kv={baseline['kv_cache_mb']:.1f}MB | "
               f"pruned tok/s={pruned['throughput_tok_s']:.1f} peak={pruned['peak_mem_mb']:.0f}MB "

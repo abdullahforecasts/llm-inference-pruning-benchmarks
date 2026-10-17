@@ -16,40 +16,62 @@ retraining.
 
 `hooks.py` attaches a `forward_hook` (via `register_forward_hook(..., with_kwargs=True)`)
 to every `self_attn` submodule. Each hook runs right after that layer's KV
-cache has been updated for the current step, and either:
+cache has been updated for the current forward pass and evicts entries once
+the cache is over budget:
 
-- **sliding_window**: keeps a few "sink" tokens (the first tokens in the
-  sequence act as an attention sink; dropping them destabilizes generation,
-  see StreamingLLM) plus the most recently seen tokens, up to `window_size`.
-- **importance**: same budget, but instead of pure recency it keeps the
-  sink tokens plus whichever cached tokens have the highest attention weight
-  (an EMA over generation steps). Needs `attn_implementation="eager"` so the
-  attention module actually returns its weights.
+- **Prefill** is chunked (`--prefill-chunk`, default 512). After every chunk
+  the cache is evicted back to `window_size`, so it never holds more than
+  `window_size + chunk` tokens, and attention during prefill is computed over
+  that bounded cache instead of the whole prompt. This is what lowers peak
+  memory.
+- **Decode** lets the cache grow to `window_size + evict_slack` and then evicts
+  back to `window_size` in one go, so the top-k and the per-layer
+  `index_select` run once every `evict_slack` steps instead of on every step.
+
+What gets kept:
+
+- **sliding_window**: a few "sink" tokens (the first tokens act as an
+  attention sink; dropping them destabilizes generation, see StreamingLLM)
+  plus the most recent tokens.
+- **importance**: the sink tokens, the most recent `obs_window` tokens, and the
+  older tokens that the last `obs_window` queries attend to most (an
+  observation-window score in the style of SnapKV, max-pooled over neighbouring
+  positions). The queries are captured with a hook on `q_proj` and rotated with
+  the layer's own RoPE, so both runs stay on SDPA attention; no eager attention
+  or full attention matrix is needed.
 
 Both operate directly on `cache.layers[layer_idx].keys` / `.values`
 (transformers' `DynamicCache` API), so they work on any model whose attention
-module exposes `layer_idx` and follows the same `[batch, heads, seq, head_dim]`
-layout, which is Qwen2/2.5 and Llama-3.x as-is, and most other decoder-only
-models with minimal changes.
+module exposes `layer_idx`, `q_proj` and follows the same
+`[batch, kv_heads, seq, head_dim]` layout: Qwen2/2.5 and Llama-3.x as-is.
 
 Positions: once the cache is compacted its length no longer equals the
 number of tokens seen, so `benchmark.py` passes the true absolute position of
-every new token (`position_ids`) during decode. Retained tokens keep the
-rotary positions they were cached with, so relative distances stay correct.
+every token (`position_ids`) during prefill and decode. Retained tokens keep
+the rotary positions they were cached with, so relative distances stay
+correct. The causal mask is built from the compacted cache length, so chunked
+prefill on a pruned cache stays causal.
+
+Baseline: the whole prompt in one forward pass and a full cache, SDPA
+attention. Both runs compute logits only for the last prompt token. The
+`--baseline-prefill-chunk` option makes the baseline chunk its prefill too, to
+separate what chunking alone buys from what the bounded cache buys.
 
 ## Files
 
 - `hooks.py`: the forward hooks and `KVCachePruner`.
-- `benchmark.py`: manual prefill + decode loop, run once with hooks attached
-  and once without, across a list of context lengths. Logs TTFT, decode
-  throughput, and peak memory to `results/benchmark.csv`.
-- `visualize.py`: loads the CSV, fits a linear memory-scaling trend per run
-  with scikit-learn, and renders the comparison figures into
-  `results/figures/`.
+- `benchmark.py`: chunked prefill + decode loop, run with and without the
+  hooks across context lengths and batch sizes. Logs TTFT, decode throughput,
+  peak memory, final KV-cache size and eviction count (mean and std over
+  repeats).
+- `quality.py`: WikiText-2 perplexity with the full cache vs. the pruned cache,
+  to show what pruning costs in output quality.
+- `visualize.py`: per-model figures (with a scikit-learn linear fit of memory
+  scaling) and a `summary.csv` of memory reduction and throughput speedup.
 - `config.py`: model registry and default sweep settings.
-- `notebooks/colab_sweep.ipynb`: the actual GPU sweep (T4 on Colab free
-  tier). CPU can't give real VRAM numbers, so this is where the headline
-  results come from.
+- `notebooks/colab_sweep.ipynb`: the GPU sweep (T4 on Colab free tier). CPU
+  can't give real VRAM numbers, so this is where the headline results come
+  from.
 
 ## Running it
 
@@ -94,16 +116,17 @@ crashes and shape bugs before spending GPU time, not to show a trend.
 Real sweep, on a GPU (Colab T4, see `notebooks/colab_sweep.ipynb`):
 
 ```bash
-python benchmark.py --model qwen2.5-0.5b --seq-lens 256 512 1024 2048 \
-    --batch-size 1 --max-new-tokens 128 --window-size 512 --mode importance \
-    --warmup 1 --repeats 3 --device cuda --out results/v1_t4/benchmark.csv
-python visualize.py --csv results/v1_t4/benchmark.csv --out-dir results/v1_t4/figures
+python benchmark.py --model llama3.2-1b --seq-lens 2048 4096 8192 \
+    --batch-size 8 --max-new-tokens 128 --window-size 512 --mode importance \
+    --prefill-chunk 512 --warmup 1 --repeats 3 --device cuda --out results/v2_t4/benchmark.csv
+python quality.py --model llama3.2-1b --contexts 2048 4096 --window-size 512 \
+    --eval-tokens 256 --out results/v2_t4/quality.csv
+python visualize.py --csv results/v2_t4/benchmark.csv --out-dir results/v2_t4/figures
 ```
 
 Each setting gets `--warmup` untimed runs and `--repeats` timed runs; the CSV
 stores mean and std for TTFT, decode time, throughput, peak memory and final
-KV-cache size. The baseline runs on SDPA attention; importance-mode pruning
-switches to eager attention because it needs the attention weights.
+KV-cache size.
 `visualize.py` writes per-model figures and a `summary.csv` that only counts
 settings where pruning actually evicted tokens.
 
