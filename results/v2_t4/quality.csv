@@ -1,0 +1,5 @@
+model,context,eval_tokens,window_size,ppl_baseline,ppl_importance,ppl_sliding_window
+qwen2.5-0.5b,2048,256,512,12.1578,12.8412,12.7255
+qwen2.5-0.5b,4096,256,512,19.9092,22.5694,23.8259
+llama3.2-1b,2048,256,512,12.2467,13.3979,12.9779
+llama3.2-1b,4096,256,512,22.2343,23.7124,23.3492

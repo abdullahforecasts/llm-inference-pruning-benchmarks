@@ -136,12 +136,74 @@ recency-only ablation for comparison against the importance-based eviction.
 
 ## Results
 
+### v2: T4 sweep (Colab, Oct 2026)
+
+Window 512 tokens (4 sink + 32 recent + 476 importance-selected), 512-token
+prefill chunks, 128 new tokens, greedy decoding, fp16, 1 warm-up + 3 timed
+repeats per setting. Full data in [`results/v2_t4/`](results/v2_t4/).
+
+**Batch 8, both runs prefill in 512-token chunks** (so the comparison isolates
+the bounded KV cache):
+
+| model        | prompt | peak VRAM baseline → pruned | VRAM saved | decode tok/s baseline → pruned | speedup |
+| ------------ | ------ | ---------------------------- | ---------- | ------------------------------- | ------- |
+| qwen2.5-0.5b | 2048   | 1430 → 1433 MB              | 0%         | 153 → 194                      | 1.26x   |
+| qwen2.5-0.5b | 4096   | 1826 → 1433 MB              | 22%        | 82 → 191                       | 2.33x   |
+| qwen2.5-0.5b | 8192   | 2617 → 1433 MB              | 45%        | 38 → 189                       | 4.96x   |
+| llama3.2-1b  | 2048   | 3555 → 3472 MB              | 2%         | 91 → 238                       | 2.61x   |
+| llama3.2-1b  | 4096   | 4564 → 3473 MB              | 24%        | 49 → 235                       | 4.79x   |
+| llama3.2-1b  | 8192   | 6582 → 3473 MB              | 47%        | 23 → 234                       | 10.0x   |
+
+The pruned run's KV cache is fixed at 53 MB (Qwen) / 142 MB (Llama) for any
+prompt length, while the baseline cache grows to 0.8 GB / 2.2 GB at 8k tokens.
+Pruned decode throughput is flat across prompt lengths; the baseline slows
+down as its cache grows, which is where the speedup comes from. The largest
+speedups partly reflect how slowly the stock HF decode path handles long
+caches on a T4.
+
+**Batch 1, baseline prefills the whole prompt in one pass** (the default HF
+usage pattern):
+
+| model        | prompt | peak VRAM baseline → pruned | decode tok/s baseline → pruned |
+| ------------ | ------ | ---------------------------- | ------------------------------- |
+| qwen2.5-0.5b | 4096   | 3331 → 1060 MB              | 29.8 → 24.3                    |
+| qwen2.5-0.5b | 8192   | 10018 → 1060 MB             | 29.7 → 24.4                    |
+| llama3.2-1b  | 4096   | 7734 → 2606 MB              | 32.2 → 35.2                    |
+| llama3.2-1b  | 8192   | out of memory                | 35.4 (2606 MB)                  |
+
+Most of this saving comes from chunked prefill: with a chunked baseline
+(`ablation_chunked_baseline.csv`), llama3.2-1b at 8192 tokens goes from
+2994 MB to 2606 MB (13%) and from 18.5 to 36.6 tok/s (1.98x). At batch 1 and
+short prompts the per-layer hook overhead makes pruning slower than the
+baseline (about 0.8x).
+
+**Ablation, recency-only eviction** (llama3.2-1b, batch 8,
+`ablation_sliding_window.csv`): same memory profile (3440 MB), slightly
+faster decode (243-247 tok/s vs. 234-238) since it skips the importance
+scoring.
+
+**Quality: WikiText-2 perplexity** (256 tokens scored after the context,
+window 512, `quality.csv`):
+
+| model        | context | full cache | importance     | sliding window |
+| ------------ | ------- | ---------- | -------------- | -------------- |
+| qwen2.5-0.5b | 2048    | 12.16      | 12.84 (+5.6%)  | 12.73 (+4.7%)  |
+| qwen2.5-0.5b | 4096    | 19.91      | 22.57 (+13.4%) | 23.83 (+19.7%) |
+| llama3.2-1b  | 2048    | 12.25      | 13.40 (+9.4%)  | 12.98 (+6.0%)  |
+| llama3.2-1b  | 4096    | 22.23      | 23.71 (+6.6%)  | 23.35 (+5.0%)  |
+
+Keeping 512 of up to 4096 cached tokens raises perplexity by 5-13% for
+importance-based eviction.
+
+Figures: [`results/v2_t4/figures/`](results/v2_t4/figures/) (main sweep),
+plus `figures_ablation_*` for the ablations.
+
 ### v0: initial T4 sweep (Colab, Sep 2026)
 
-| model | peak VRAM reduction | decode throughput (pruned / baseline) |
-|---|---|---|
-| qwen2.5-0.5b | 0.6% | 0.82x |
-| llama3.2-1b | 0.5% | 0.82x |
+| model        | peak VRAM reduction | decode throughput (pruned / baseline) |
+| ------------ | ------------------- | ------------------------------------- |
+| qwen2.5-0.5b | 0.6%                | 0.82x                                 |
+| llama3.2-1b  | 0.5%                | 0.82x                                 |
 
 Batch 1, prompts of 256-2048 tokens, 128 new tokens, window 512, 4 sink tokens,
 importance mode, fp16 on a T4. At this scale the KV cache is a small share of
@@ -149,5 +211,3 @@ peak memory and pruning applies after prefill; v1 adds chunked prefill with
 eviction, amortized eviction, and longer-context / larger-batch runs.
 
 Data, figures and Colab screenshots: [`results/v0_t4_initial/`](results/v0_t4_initial/).
-
-The last repo got lost, so this is a new one and i am working on this to regain all previous results.

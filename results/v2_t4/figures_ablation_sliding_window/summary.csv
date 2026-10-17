@@ -1,0 +1,2 @@
+model,batch_size,seq_lens,baseline_oom_at,mean_peak_mem_reduction_pct,max_peak_mem_reduction_pct,mean_throughput_speedup_x,max_throughput_speedup_x
+llama3.2-1b,8,2048 4096 8192,,25.2,47.73,6.033,10.398
