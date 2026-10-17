@@ -107,8 +107,18 @@ recency-only ablation for comparison against the importance-based eviction.
 
 ## Results
 
-Headline numbers (peak VRAM reduction, throughput speedup) get filled in
-here once the Colab sweep has run. See `results/benchmark.csv` and
-`results/figures/` after running `notebooks/colab_sweep.ipynb`.
+### v0: initial T4 sweep (Colab, Sep 2026)
+
+| model | peak VRAM reduction | decode throughput (pruned / baseline) |
+|---|---|---|
+| qwen2.5-0.5b | 0.6% | 0.82x |
+| llama3.2-1b | 0.5% | 0.82x |
+
+Batch 1, prompts of 256-2048 tokens, 128 new tokens, window 512, 4 sink tokens,
+importance mode, fp16 on a T4. At this scale the KV cache is a small share of
+peak memory and pruning applies after prefill; v1 adds chunked prefill with
+eviction, amortized eviction, and longer-context / larger-batch runs.
+
+Data, figures and Colab screenshots: [`results/v0_t4_initial/`](results/v0_t4_initial/).
 
 The last repo got lost, so this is a new one and i am working on this to regain all previous results.
