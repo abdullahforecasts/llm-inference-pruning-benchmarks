@@ -154,6 +154,26 @@ def _run_repeated(model, prompt_ids, args, prune_cfg, prefill_chunk):
     return agg
 
 
+def finished_settings(args):
+    """Prompt lengths already recorded in args.out for this exact configuration."""
+    if not os.path.exists(args.out):
+        return set()
+    done = set()
+    with open(args.out, newline="") as f:
+        for row in csv.DictReader(f):
+            if (row.get("run") == "pruned" and row.get("model") == args.model
+                    and row.get("batch_size") == str(args.batch_size) and row.get("mode") == args.mode
+                    and row.get("window_size") == str(args.window_size)):
+                done.add(int(row["seq_len"]))
+    # also require the baseline row with the same baseline prefill chunk
+    with open(args.out, newline="") as f:
+        base_done = {int(r["seq_len"]) for r in csv.DictReader(f)
+                     if r.get("run") == "baseline" and r.get("model") == args.model
+                     and r.get("batch_size") == str(args.batch_size)
+                     and r.get("prefill_chunk") == str(args.baseline_prefill_chunk)}
+    return done & base_done
+
+
 def load_model(args):
     if args.model == "smoke":
         from transformers import Qwen2Config, Qwen2ForCausalLM
@@ -188,6 +208,8 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out", default="results/benchmark.csv")
+    parser.add_argument("--resume", action="store_true",
+                        help="skip prompt lengths already in --out for this model/batch/mode/baseline chunk")
     parser.add_argument("--smoke", action="store_true",
                         help="tiny random-weight model, no download - for testing the pipeline")
     args = parser.parse_args()
@@ -199,7 +221,11 @@ def main():
     prune_cfg = PruneConfig(window_size=args.window_size, sink_tokens=args.sink_tokens, mode=args.mode,
                             obs_window=args.obs_window, evict_slack=args.evict_slack)
 
+    done = finished_settings(args) if args.resume else set()
     for seq_len in args.seq_lens:
+        if seq_len in done:
+            print(f"seq_len={seq_len} bs={args.batch_size} | already in {args.out}, skipping", flush=True)
+            continue
         prompt_ids = build_prompt(tokenizer, seq_len, args.batch_size, args.device, vocab_size)
         actual_len = prompt_ids.shape[1]
 

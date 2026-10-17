@@ -53,13 +53,14 @@ Main sweep: importance-based eviction, window 512.
   (`--baseline-prefill-chunk 512`) but keeps the full cache, so both runs fit
   and the comparison isolates the effect of the bounded cache.
 
-Results are appended to the CSV after every prompt length, so a crash keeps
-what already finished.
+Results are appended to the CSV after every prompt length, and `--resume`
+skips settings that are already in it, so an interrupted cell can simply be
+run again.
 """),
     ("code", """\
 RUN = "v2_t4"
 OUT = f"results/{RUN}/benchmark.csv"
-COMMON = "--max-new-tokens 128 --window-size 512 --sink-tokens 4 --prefill-chunk 512 --warmup 1 --repeats 3 --device cuda"
+COMMON = "--max-new-tokens 128 --window-size 512 --sink-tokens 4 --prefill-chunk 512 --warmup 1 --repeats 3 --device cuda --resume"
 """),
     ("code", """\
 !python benchmark.py --model qwen2.5-0.5b --batch-size 1 --seq-lens 1024 2048 4096 8192 --mode importance {COMMON} --out {OUT}
